@@ -13,11 +13,16 @@
 #           existing docker-ce DEBIAN/postinst, so `apt install docker-ce`
 #           seeds /mnt/data layout, symlinks, daemon.json and iptables-legacy
 #           BEFORE debhelper's auto-generated start of docker.service;
-#        c. append `docker-compose-plugin` to Depends — so a single
+#        c. inject the WB teardown snippet (repack/postrm-snippet.sh) into the
+#           docker-ce DEBIAN/postrm, so `apt purge docker-ce` stops containerd
+#           and removes the WB symlinks before the operator wipes Docker state
+#           on /mnt/data (a dangling /var/lib/containerd would wedge any other
+#           containerd installed later);
+#        d. append `docker-compose-plugin` to Depends — so a single
 #           `apt install docker-ce` against our local apt-repo brings in the
 #           compose plugin alongside the daemon;
-#        d. bump Version in DEBIAN/control with the WB suffix;
-#        e. repack with dpkg-deb --root-owner-group.
+#        e. bump Version in DEBIAN/control with the WB suffix;
+#        f. repack with dpkg-deb --root-owner-group.
 #   3. docker-ce-cli, containerd.io and docker-compose-plugin are mirrored
 #      as-is from src/ into artifacts/ — same upstream filename, same Version,
 #      byte-identical contents. They live in the WB apt repo so Docker installs
@@ -97,6 +102,7 @@ OUT_DIR="${HERE}/out"
 ART_DIR="${HERE}/artifacts"
 OVERLAY_DIR="${HERE}/overlay"
 POSTINST_SNIPPET="${HERE}/postinst-snippet.sh"
+POSTRM_SNIPPET="${HERE}/postrm-snippet.sh"
 
 # Resolve the md5 tool. GNU coreutils ships `md5sum` on Linux; on macOS
 # `brew install coreutils` exposes it as `gmd5sum` (the unprefixed name lives
@@ -279,6 +285,85 @@ inject_postinst() {
     rm -f "${snippet_body}"
 }
 
+# Inject the WB teardown snippet into the docker-ce DEBIAN/postrm. The snippet
+# (repack/postrm-snippet.sh) stops containerd on purge, so the manual wipe of
+# Docker state on /mnt/data (README, "Удалить") never races a live daemon — a
+# running containerd keeps deleted metadata files open and serves ghost state
+# afterwards (pulls "succeed" without downloading, then "blob not found").
+#
+# Same strategy as inject_postinst: inline the snippet body (minus its shebang)
+# right after the first `set -e` line of the upstream postrm, wrapped in
+# BEGIN/END markers. The snippet is guarded by `[ "$1" = "purge" ]`, so
+# upgrade/remove/abort-* paths stay no-ops. Asserts a `set -e` line exists —
+# fails loudly on upstream format changes; synthesizes a minimal postrm should
+# a future upstream stop shipping one.
+inject_postrm() {
+    local stage="$1" snippet="$2"
+    local postrm="${stage}/DEBIAN/postrm"
+
+    if [[ ! -f "${snippet}" ]]; then
+        echo "[fail] postrm snippet missing at ${snippet}"
+        return 1
+    fi
+
+    # Strip the snippet's own shebang line into a temp file — the upstream
+    # postrm already has one. Keep everything else verbatim.
+    local snippet_body
+    snippet_body=$(mktemp)
+    sed -e '1{/^#!/d;}' "${snippet}" > "${snippet_body}"
+
+    if [[ ! -f "${postrm}" ]]; then
+        # Upstream docker-ce ships a postrm, but be defensive in case a
+        # future version stops doing so — synthesize a minimal one.
+        {
+            echo '#!/bin/sh'
+            echo 'set -e'
+            echo
+            echo '# --- BEGIN wb-docker teardown ---'
+            cat "${snippet_body}"
+            echo '# --- END wb-docker teardown ---'
+            echo
+            echo 'exit 0'
+        } > "${postrm}"
+        chmod 0755 "${postrm}"
+        rm -f "${snippet_body}"
+        return 0
+    fi
+
+    if ! grep -q '^set -e' "${postrm}"; then
+        echo "[fail] no 'set -e' line in ${postrm}; refusing to inject blindly"
+        rm -f "${snippet_body}"
+        return 1
+    fi
+
+    local tmp
+    tmp=$(mktemp)
+    awk -v body_file="${snippet_body}" '
+        BEGIN { injected = 0 }
+        {
+            print
+            if (!injected && $0 ~ /^set -e/) {
+                print ""
+                print "# --- BEGIN wb-docker teardown ---"
+                while ((getline line < body_file) > 0) print line
+                close(body_file)
+                print "# --- END wb-docker teardown ---"
+                injected = 1
+            }
+        }
+        END {
+            if (!injected) exit 1
+        }
+    ' "${postrm}" > "${tmp}" || {
+        echo "[fail] failed to locate '^set -e' insertion point in ${postrm}"
+        rm -f "${tmp}" "${snippet_body}"
+        return 1
+    }
+    mv "${tmp}" "${postrm}"
+    chmod 0755 "${postrm}"
+    rm -f "${snippet_body}"
+}
+
 # Append a new dependency to the Depends: line in DEBIAN/control. Asserts the
 # field is single-line (upstream docker-ce keeps it that way; if a future
 # upstream rewraps it onto multiple lines, this assertion catches the change
@@ -296,8 +381,9 @@ append_depends() {
     grep -q "^Depends:.*${new_dep}" "${control}"
 }
 
-# docker-ce: unpack, layer the WB overlay tree, inject the WB postinst snippet,
-# append the docker-compose-plugin Depends, bump Version, repack.
+# docker-ce: unpack, layer the WB overlay tree, inject the WB postinst and
+# postrm snippets, append the docker-compose-plugin Depends, bump Version,
+# repack.
 repack_docker_ce() {
     local upstream="$1"
     local src="${SRC_DIR}/docker-ce_${upstream}_${ARCH}.deb"
@@ -310,6 +396,8 @@ repack_docker_ce() {
     inject_overlay "${stage}" "${OVERLAY_DIR}"
     inject_postinst "${stage}" "${POSTINST_SNIPPET}" \
         || { echo "[fail    ] postinst injection failed" >&2; exit 1; }
+    inject_postrm "${stage}" "${POSTRM_SNIPPET}" \
+        || { echo "[fail    ] postrm injection failed" >&2; exit 1; }
     append_depends "${stage}/DEBIAN/control" \
         "docker-compose-plugin (>= ${COMPOSE_VERSION})" \
         || { echo "[fail    ] Depends patch failed" >&2; exit 1; }
