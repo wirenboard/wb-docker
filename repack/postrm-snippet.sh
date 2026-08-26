@@ -8,8 +8,9 @@ if [ "$1" = "purge" ]; then
     if [ -d /run/systemd/system ]; then
         systemctl stop containerd.service 2>/dev/null || true
     fi
+    # Remove only dangling links; live /mnt/data data keeps its link.
     for link in /var/lib/containerd /etc/docker; do
-        if [ -L "$link" ]; then
+        if [ -L "$link" ] && [ ! -e "$link" ]; then
             case "$(readlink "$link")" in
                 /mnt/data/*) rm -f "$link" ;;
             esac
