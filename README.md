@@ -149,13 +149,13 @@ docker run --rm hello-world
 Штатное удаление (с сохранением пользовательских данных на `/mnt/data`):
 
 ```bash
-apt purge docker-ce && apt autoremove --purge
+apt purge docker-ce docker-ce-cli containerd.io docker-compose-plugin && apt autoremove --purge
 ```
 
 Полное удаление вместе с образами и контейнерами:
 
 ```bash
-apt purge docker-ce && apt autoremove --purge
+apt purge docker-ce docker-ce-cli containerd.io docker-compose-plugin && apt autoremove --purge
 rm -rf /mnt/data/docker /mnt/data/.docker /mnt/data/etc/docker \
        /mnt/data/var/lib/containerd
 ```
