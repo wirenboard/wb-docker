@@ -31,6 +31,13 @@ WB нестандартна. Всё это встроено в установк�
 В скачанный `docker-ce.deb` **встраиваем свой код в установочный скрипт**
 `postinst` — вставляем блок сразу после строки `set -e`, обёрнутый маркерами
 `# --- BEGIN/END wb-docker setup ---` (родной код Docker остаётся нетронутым).
+Симметрично в скрипт удаления `postrm` встраивается небольшой teardown-блок
+(маркеры `# --- BEGIN/END wb-docker teardown ---`): при `apt purge docker-ce`
+он останавливает `containerd` — чтобы ручная очистка данных на `/mnt/data`
+(см. «Удалить») не выполнялась под работающим демоном — и убирает наши
+симлинки, оставшиеся висячими после удаления данных (такой линк ломал бы
+установку другого containerd, например из `docker.io`). Данные на `/mnt/data`
+не трогаются.
 Плюс кладём в пакет overlay-файлы — шаблон `daemon.json` и systemd-drop-in,
 привязывающий старт `containerd` к монтированию `/mnt/data`, — и добавляем
 `docker-compose-plugin` в зависимости `docker-ce`, чтобы один
@@ -76,6 +83,7 @@ WB нестандартна. Всё это встроено в установк�
 repack/
 ├── repack-docker-ce.sh     — главный скрипт сборки
 ├── postinst-snippet.sh     — WB-setup, инжектится в docker-ce DEBIAN/postinst
+├── postrm-snippet.sh       — WB-teardown, инжектится в docker-ce DEBIAN/postrm
 ├── overlay/                — файлы, инжектящиеся в дерево docker-ce.deb
 │   ├── usr/share/wb-docker/daemon.json                       — шаблон daemon.json (data-root на /mnt/data)
 │   └── etc/systemd/system/containerd.service.d/mnt-data.conf — containerd стартует после монтирования /mnt/data
@@ -140,16 +148,18 @@ docker run --rm hello-world
 
 ### Удалить
 
-Пакет намеренно не содержит postrm-отката: данные, конфиги и `daemon.json`
-живут на `/mnt/data` и переживают `apt purge` и переустановку. Симлинки
-`/etc/docker` и `/var/lib/containerd` остаются указывать на `/mnt/data` и
-безвредны без пакета — переустановка их пересоздаёт. Полную очистку делают
-вручную (см. ниже).
+Пакет намеренно не удаляет данные: данные, конфиги и `daemon.json` живут на
+`/mnt/data` и переживают `apt purge` и переустановку. Наш postrm при purge
+делает два действия: останавливает `containerd` (см. ниже, почему это важно)
+и убирает WB-симлинки `/var/lib/containerd` и `/etc/docker`, если их цель на
+`/mnt/data` уже удалена (висячие). При живых данных симлинки остаются — и
+переустановка сразу их подхватывает. Полную очистку данных делают вручную
+(см. ниже).
 
 Штатное удаление (с сохранением пользовательских данных на `/mnt/data`):
 
 ```bash
-apt purge docker-ce docker-ce-cli containerd.io docker-compose-plugin && apt autoremove --purge
+apt purge docker-ce && apt autoremove --purge
 ```
 
 Полное удаление вместе с образами и контейнерами:
@@ -158,7 +168,25 @@ apt purge docker-ce docker-ce-cli containerd.io docker-compose-plugin && apt aut
 apt purge docker-ce docker-ce-cli containerd.io docker-compose-plugin && apt autoremove --purge
 rm -rf /mnt/data/docker /mnt/data/.docker /mnt/data/etc/docker \
        /mnt/data/var/lib/containerd
+[ ! -L /var/lib/containerd ] || rm /var/lib/containerd
 ```
+
+Последняя строка — для установок со старыми версиями пакета, чей postrm ещё
+не убирал симлинк: оставшийся висячим `/var/lib/containerd` ломает установку
+другого containerd (например, из `docker.io` — тот падает в рестарт-цикле на
+`mkdir: file exists`). Удаляется именно симлинк; на свежих версиях его уже
+снял postrm, и строка ничего не делает.
+
+Здесь все четыре пакета перечислены явно — на `apt autoremove` полагаться
+нельзя: он убирает только пакеты с пометкой automatic, а после установки из
+локальных `.deb` (или явного `apt install containerd.io`) они помечены manual
+и остаются. Критично, что prerm `containerd.io` останавливает демона **до**
+`rm -rf`: удалять данные из-под работающего containerd нельзя — он держит
+удалённые файлы метаданных открытыми и продолжает отдавать «призрачное»
+состояние (pull «проходит» без скачивания, после перезапуска демона —
+`blob not found`). Свежие версии пакета дополнительно страхуют это в postrm
+(purge `docker-ce` сам останавливает containerd), но на установках со старыми
+версиями действует их старый postrm — команда выше безопасна на любых.
 
 ## Переход со старого Docker
 
