@@ -40,7 +40,9 @@ wb-docker-ce-repack производит набор из 4 пакетов на �
 4. Поставить артефакты сборки на тестовый контроллер и проверить: `docker run
    --rm hello-world`, `docker compose version`, апгрейд поверх прошлой версии,
    апгрейд поверх `docker-ce` с download.docker.com (не должен менять ни
-   `daemon.json`, ни `/etc/docker`, ни data-root).
+   `daemon.json`, ни `/etc/docker`, ни data-root) и `wb-docker-setup` на хосте
+   с containerd-стором от прежней установки (старый стор уезжает в
+   `.orphaned-<дата>`, `docker images` работает).
 5. После ревью влить PR в `main`. CI пересоберёт и положит пакеты в пул. Дальше
    они попадают в testing по расписанию wb-releases (≈раз в час).
 

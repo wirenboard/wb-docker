@@ -243,6 +243,11 @@ docker save my-image:tag -o /mnt/data/my-image.tar   # или docker push в reg
 docker load -i /mnt/data/my-image.tar
 ```
 
+Если на `/mnt/data` осталось состояние containerd от прежней установки пакета,
+переход не сливает два стора в один (это ломает образы: `blob not found`), а
+отодвигает старый в `/mnt/data/var/lib/containerd.orphaned-<дата>` и пишет об
+этом в лог. Каталог можно удалить, когда убедились, что он не нужен.
+
 Данные в томах (`/var/lib/docker/volumes`) `docker save` не покрывает —
 бэкапьте их отдельно. Установка WB Docker прежний `/var/lib/docker` не удаляет:
 при установке в лог `apt` выводится предупреждение, а данные остаются на диске и

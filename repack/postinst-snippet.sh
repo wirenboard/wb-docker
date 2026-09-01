@@ -96,6 +96,24 @@ migrate_rootfs_to_persistent() {
     log "linked ${rootfs_path} -> ${persistent_path}"
 }
 
+# A containerd store is one coherent unit: bolt metadata plus content blobs.
+containerd_store_present() {
+    [ -d "$1/io.containerd.metadata.v1.bolt" ] || [ -d "$1/io.containerd.content.v1.content" ]
+}
+
+# Merging two stores gives the daemon metadata from one and blobs from the other
+# ("blob not found"). The rootfs one is live; a live /mnt/data store would sit
+# behind the symlink and this code would not run, so that one is orphaned.
+set_aside_orphaned_containerd() {
+    [ ! -L "$ROOTFS_CONTAINERD" ] && \
+    containerd_store_present "$ROOTFS_CONTAINERD" && \
+    containerd_store_present "$PERSISTENT_CONTAINERD" || return 0
+
+    orphaned="${PERSISTENT_CONTAINERD}.orphaned-$(date +%Y%m%d%H%M%S)"
+    mv "$PERSISTENT_CONTAINERD" "$orphaned"
+    log "moved containerd state of an earlier install aside: ${orphaned}"
+}
+
 # Migrate /var/lib/containerd onto /mnt/data, then restart containerd if it was
 # actually migrated. containerd.io started containerd before this postinst, so
 # it has meta.db open on the old rootfs /var/lib/containerd. The migration
@@ -104,6 +122,8 @@ migrate_rootfs_to_persistent() {
 # (losing all image/container metadata). The pre-migration detection has to
 # happen before migrate_rootfs_to_persistent turns the path into a symlink.
 setup_containerd_symlink() {
+    set_aside_orphaned_containerd
+
     containerd_was_migrated=no
     if [ -L "$ROOTFS_CONTAINERD" ]; then
         [ "$(readlink "$ROOTFS_CONTAINERD")" = "$PERSISTENT_CONTAINERD" ] || containerd_was_migrated=yes
