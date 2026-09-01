@@ -18,11 +18,13 @@
 #           and removes the WB symlinks before the operator wipes Docker state
 #           on /mnt/data (a dangling /var/lib/containerd would wedge any other
 #           containerd installed later);
-#        d. append `docker-compose-plugin` to Depends — so a single
+#        d. ship the same setup snippet as /usr/bin/wb-docker-setup, for applying
+#           the WB layout by hand where postinst declines to do it;
+#        e. append `docker-compose-plugin` to Depends — so a single
 #           `apt install docker-ce` against our local apt-repo brings in the
 #           compose plugin alongside the daemon;
-#        e. bump Version in DEBIAN/control with the WB suffix;
-#        f. repack with dpkg-deb --root-owner-group.
+#        f. bump Version in DEBIAN/control with the WB suffix;
+#        g. repack with dpkg-deb --root-owner-group.
 #   3. docker-ce-cli, containerd.io and docker-compose-plugin are mirrored
 #      as-is from src/ into artifacts/ — same upstream filename, same Version,
 #      byte-identical contents. They live in the WB apt repo so Docker installs
@@ -200,6 +202,17 @@ inject_overlay() {
     ) >> "${md5sums}"
 
     sort -k2 -o "${md5sums}" "${md5sums}"
+}
+
+# The snippet doubles as the operator-facing command; it dispatches on argv.
+install_setup_command() {
+    local stage="$1" snippet="$2"
+    local dest="usr/bin/wb-docker-setup"
+
+    mkdir -p "${stage}/usr/bin"
+    install -m 0755 "${snippet}" "${stage}/${dest}"
+    ( cd "${stage}" && "${MD5SUM}" "${dest}" ) >> "${stage}/DEBIAN/md5sums"
+    echo "[command ] /${dest}"
 }
 
 # Inject the WB setup snippet into the docker-ce DEBIAN/postinst. The snippet
@@ -393,6 +406,7 @@ repack_docker_ce() {
     rm -rf "${stage}"
     dpkg-deb -R "${src}" "${stage}"
 
+    install_setup_command "${stage}" "${POSTINST_SNIPPET}"
     inject_overlay "${stage}" "${OVERLAY_DIR}"
     inject_postinst "${stage}" "${POSTINST_SNIPPET}" \
         || { echo "[fail    ] postinst injection failed" >&2; exit 1; }
