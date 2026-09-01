@@ -1,5 +1,8 @@
 {
   "data-root": "/mnt/data/docker/lib",
+  "features": {
+    "containerd-snapshotter": true
+  },
   "log-driver": "json-file",
   "log-opts": {
     "max-size": "10m",
