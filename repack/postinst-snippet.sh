@@ -344,8 +344,10 @@ community_layout_in_use() {
 # An empty $1 means a first install — the deliberate act.
 dpkg_configure() {
     if [ -z "${1-}" ]; then
+        log "first install of this package — applying the WB layout"
         run_setup
     elif our_own_version "$1" && layout_in_place && ! community_layout_in_use; then
+        log "upgrade from ${1} — re-applying the WB layout"
         run_setup
     else
         decline_setup "$1"
