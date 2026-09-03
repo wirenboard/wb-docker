@@ -9,22 +9,24 @@
 #        a. inject the WB overlay tree from repack/overlay/ into the .deb's
 #           data archive (currently: a daemon.json template), regenerate
 #           DEBIAN/md5sums for new files;
-#        b. inject the WB setup snippet (repack/postinst-snippet.sh) into the
+#        b. inject the WB install marker (repack/preinst-snippet.sh) into
+#           DEBIAN/preinst, so the postinst can tell an install from an upgrade;
+#        c. inject the WB setup snippet (repack/postinst-snippet.sh) into the
 #           existing docker-ce DEBIAN/postinst, so `apt install docker-ce`
 #           seeds /mnt/data layout, symlinks, daemon.json and iptables-legacy
 #           BEFORE debhelper's auto-generated start of docker.service;
-#        c. inject the WB teardown snippet (repack/postrm-snippet.sh) into the
+#        d. inject the WB teardown snippet (repack/postrm-snippet.sh) into the
 #           docker-ce DEBIAN/postrm, so `apt purge docker-ce` stops containerd
 #           and removes the WB symlinks before the operator wipes Docker state
 #           on /mnt/data (a dangling /var/lib/containerd would wedge any other
 #           containerd installed later);
-#        d. ship the same setup snippet as /usr/bin/wb-docker-setup, for applying
+#        e. ship the same setup snippet as /usr/bin/wb-docker-setup, for applying
 #           the WB layout by hand where postinst declines to do it;
-#        e. append `docker-compose-plugin` to Depends — so a single
+#        f. append `docker-compose-plugin` to Depends — so a single
 #           `apt install docker-ce` against our local apt-repo brings in the
 #           compose plugin alongside the daemon;
-#        f. bump Version in DEBIAN/control with the WB suffix;
-#        g. repack with dpkg-deb --root-owner-group.
+#        g. bump Version in DEBIAN/control with the WB suffix;
+#        h. repack with dpkg-deb --root-owner-group.
 #   3. docker-ce-cli, containerd.io and docker-compose-plugin are mirrored
 #      as-is from src/ into artifacts/ — same upstream filename, same Version,
 #      byte-identical contents. They live in the WB apt repo so Docker installs
@@ -103,6 +105,7 @@ SRC_DIR="${HERE}/src"
 OUT_DIR="${HERE}/out"
 ART_DIR="${HERE}/artifacts"
 OVERLAY_DIR="${HERE}/overlay"
+PREINST_SNIPPET="${HERE}/preinst-snippet.sh"
 POSTINST_SNIPPET="${HERE}/postinst-snippet.sh"
 POSTRM_SNIPPET="${HERE}/postrm-snippet.sh"
 
@@ -317,6 +320,8 @@ repack_docker_ce() {
 
     install_setup_command "${stage}" "${POSTINST_SNIPPET}"
     inject_overlay "${stage}" "${OVERLAY_DIR}"
+    inject_snippet "${stage}" preinst  "${PREINST_SNIPPET}"  "install marker" \
+        || { echo "[fail    ] preinst injection failed" >&2; exit 1; }
     inject_snippet "${stage}" postinst "${POSTINST_SNIPPET}" "setup" \
         || { echo "[fail    ] postinst injection failed" >&2; exit 1; }
     inject_snippet "${stage}" postrm   "${POSTRM_SNIPPET}"   "teardown" \

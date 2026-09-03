@@ -35,6 +35,8 @@ ROOTFS_ETC_DOCKER=/etc/docker
 ROOTFS_CONTAINERD=/var/lib/containerd
 ROOTFS_DOCKER_DATA=/var/lib/docker
 
+FIRST_INSTALL_MARKER=/run/wb-docker-first-install
+
 DAEMON_JSON_TEMPLATE=/usr/share/wb-docker/daemon.json
 DAEMON_JSON_TARGET="${PERSISTENT_ETC_DOCKER}/daemon.json"
 
@@ -341,9 +343,18 @@ community_layout_in_use() {
     [ -d "$COMMUNITY_LEGACY_DOCKER_DATA" ] && [ ! -L "$COMMUNITY_LEGACY_DOCKER_DATA" ]
 }
 
-# An empty $1 means a first install — the deliberate act.
-dpkg_configure() {
+# `configure <version>` looks the same for an upgrade and for an install over a
+# package that was removed but not purged, so the preinst snippet marks which
+# one dpkg was doing.
+first_install() {
     if [ -z "${1-}" ]; then
+        return 0
+    fi
+    [ -e "$FIRST_INSTALL_MARKER" ]
+}
+
+dpkg_configure() {
+    if first_install "${1-}"; then
         log "first install of this package — applying the WB layout"
         run_setup
     elif our_own_version "$1" && layout_in_place && ! community_layout_in_use; then
@@ -412,7 +423,8 @@ USAGE
 
 # dpkg passes its maintainer-script action as $1; an operator passes flags.
 case "${1-}" in
-    configure)  dpkg_configure "${2-}" ;;
+    configure)  dpkg_configure "${2-}"
+                rm -f "$FIRST_INSTALL_MARKER" ;;
     "")         manual_setup no ;;
     --yes|-y)   manual_setup yes ;;
     -h|--help)  usage ;;

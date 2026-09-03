@@ -24,6 +24,7 @@ wb-docker-ce-repack производит набор из 4 пакетов на �
 | `Jenkinsfile` | точка входа CI, вызывает `buildDockerRepack`. |
 | `repack/repack-docker-ce.sh` | механика: скачать upstream, перепаковать docker-ce, зеркалировать остальные 3. |
 | `repack/overlay/` | файлы, инжектируемые внутрь docker-ce (шаблон `daemon.json` + systemd-drop-in для containerd). |
+| `repack/preinst-snippet.sh` | метка установки: отличает `apt install` от обновления, инжектится в preinst docker-ce. |
 | `repack/postinst-snippet.sh` | WB-setup (`/mnt/data`, симлинки, daemon.json, iptables-legacy). Инжектится в postinst docker-ce и ставится как `/usr/bin/wb-docker-setup` для осознанного ручного применения. |
 
 ## Как выпустить новую версию
@@ -40,7 +41,9 @@ wb-docker-ce-repack производит набор из 4 пакетов на �
 4. Поставить артефакты сборки на тестовый контроллер и проверить: `docker run
    --rm hello-world`, `docker compose version`, апгрейд поверх прошлой версии,
    апгрейд поверх `docker-ce` с download.docker.com (не должен менять ни
-   `daemon.json`, ни `/etc/docker`, ни data-root) и установку на хосте, где на
+   `daemon.json`, ни `/etc/docker`, ни data-root), установку поверх удалённого
+   через `apt remove` чужого `docker-ce` (настройка должна выполниться) и
+   установку на хосте, где на
    `/mnt/data` остался стор containerd от прежней установки: реальный стор
    должен подхватиться, а уезжать в `.orphaned-<дата>` — только когда на rootfs
    есть свой стор с данными.
