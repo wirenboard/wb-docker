@@ -360,7 +360,8 @@ report_data_root() {
     log "  add '\"data-root\": \"${PERSISTENT_DOCKER_DATA}\"' to ${DAEMON_JSON_TARGET} to move it"
 }
 
-# Manual run: the layout changes under a live Docker, so confirm and restart.
+# Manual run: dpkg stops the daemon around an upgrade, a manual run has to do it
+# itself — the containerd store must not move under a running containerd.
 manual_setup() {
     if [ "${1-no}" != yes ] && orphan_docker_data_present; then
         log "images and containers in ${ROOTFS_DOCKER_DATA} will stop being visible"
@@ -377,12 +378,22 @@ manual_setup() {
         esac
     fi
 
+    docker_was_active=no
+    if [ -d /run/systemd/system ]; then
+        if systemctl is-active --quiet docker.service 2>/dev/null; then
+            docker_was_active=yes
+        fi
+        log "stopping docker and containerd for the switch"
+        systemctl stop docker.socket docker.service containerd.service 2>/dev/null || true
+    fi
+
     run_setup
     report_data_root
 
-    if [ -d /run/systemd/system ] && systemctl is-active --quiet docker.service 2>/dev/null; then
-        log "restarting docker.service"
-        systemctl restart docker.service || log "WARN: docker.service restart failed"
+    if [ "$docker_was_active" = yes ]; then
+        log "starting containerd and docker again"
+        systemctl start containerd.service docker.service || \
+            log "WARN: could not start docker again — check 'systemctl status docker'"
     fi
 }
 
