@@ -1,12 +1,14 @@
 #!/bin/sh
-# Wiren Board Docker integration: install-time setup, injected into docker-ce's
-# DEBIAN/postinst by repack/repack-docker-ce.sh. Runs ONCE on `apt install
-# docker-ce` before debhelper's auto-generated `deb-systemd-invoke start
-# docker.service` block, so the daemon starts already pointing at /mnt/data.
+# Wiren Board Docker integration: /mnt/data layout, symlinks, daemon.json,
+# iptables-legacy.
 #
-# This snippet is not a standalone executable: the repack script reads its body
-# (minus the shebang) and inlines it after `set -e` inside docker-ce's postinst,
-# wrapped in BEGIN/END markers.
+# repack/repack-docker-ce.sh inlines the body (minus the shebang) into docker-ce's
+# DEBIAN/postinst after `set -e`, ahead of debhelper's start of docker.service,
+# and ships the same file as /usr/bin/wb-docker-setup. Dispatch at the bottom.
+#
+# The setup runs only on a first install of this package or on top of a previous
+# run of it — never on a Docker laid out by someone else: moving its data-root to
+# /mnt/data would orphan its images and containers.
 #
 # No postrm/prerm counterpart, by design. Everything this snippet creates is
 # meant to outlive package removal: Docker data, configs and daemon.json all
@@ -17,8 +19,10 @@
 # user-driven action (see the "Удалить" section in README), not something a
 # package maintainer script should do automatically.
 #
-# Structure: config below, then one function per install step, then a short
-# entry point at the bottom that runs the steps in order on `configure`.
+# Structure: config below, then one function per setup step, then the entry
+# point dispatch at the bottom.
+
+set -e
 
 PERSISTENT_ROOT=/mnt/data
 PERSISTENT_ETC_DOCKER="${PERSISTENT_ROOT}/etc/docker"
@@ -30,6 +34,8 @@ COMMUNITY_LEGACY_DOCKER_DATA="${PERSISTENT_ROOT}/.docker"
 ROOTFS_ETC_DOCKER=/etc/docker
 ROOTFS_CONTAINERD=/var/lib/containerd
 ROOTFS_DOCKER_DATA=/var/lib/docker
+
+FIRST_INSTALL_MARKER=/run/wb-docker-first-install
 
 DAEMON_JSON_TEMPLATE=/usr/share/wb-docker/daemon.json
 DAEMON_JSON_TARGET="${PERSISTENT_ETC_DOCKER}/daemon.json"
@@ -92,6 +98,32 @@ migrate_rootfs_to_persistent() {
     log "linked ${rootfs_path} -> ${persistent_path}"
 }
 
+# containerd.io starts the daemon before this runs, so the plugin directories on
+# the rootfs always exist — only blobs tell a real store from a fresh empty one.
+containerd_store_has_content() {
+    [ -n "$(ls -A "$1/io.containerd.content.v1.content/blobs/sha256" 2>/dev/null)" ] || \
+    [ -n "$(ls -A "$1/io.containerd.snapshotter.v1.overlayfs/snapshots" 2>/dev/null)" ]
+}
+
+# Merging two stores gives the daemon metadata from one and blobs from the other
+# ("blob not found"), so pick one. A live /mnt/data store sits behind the symlink
+# and this code does not run at all — so when both have content, the one on
+# /mnt/data is from an earlier install and goes aside. An empty rootfs store
+# (fresh containerd, e.g. after a firmware update) is the throwaway one instead.
+resolve_containerd_stores() {
+    [ ! -L "$ROOTFS_CONTAINERD" ] && [ -d "$ROOTFS_CONTAINERD" ] && \
+    containerd_store_has_content "$PERSISTENT_CONTAINERD" || return 0
+
+    if containerd_store_has_content "$ROOTFS_CONTAINERD"; then
+        orphaned="${PERSISTENT_CONTAINERD}.orphaned-$(date +%Y%m%d%H%M%S)"
+        mv "$PERSISTENT_CONTAINERD" "$orphaned"
+        log "moved containerd state of an earlier install aside: ${orphaned}"
+    else
+        rm -rf "$ROOTFS_CONTAINERD"
+        log "kept the containerd state on ${PERSISTENT_ROOT}, dropped the empty one on rootfs"
+    fi
+}
+
 # Migrate /var/lib/containerd onto /mnt/data, then restart containerd if it was
 # actually migrated. containerd.io started containerd before this postinst, so
 # it has meta.db open on the old rootfs /var/lib/containerd. The migration
@@ -106,6 +138,8 @@ setup_containerd_symlink() {
     elif [ -e "$ROOTFS_CONTAINERD" ]; then
         containerd_was_migrated=yes
     fi
+
+    resolve_containerd_stores
 
     migrate_rootfs_to_persistent "$ROOTFS_CONTAINERD" "$PERSISTENT_CONTAINERD" || true
 
@@ -200,6 +234,7 @@ release_needs_legacy_iptables() {
             num=${release_name#wb-}
             [ "$num" -ge 2304 ] ;;
         *)
+            log "iptables: unknown release '${release_name}' — legacy backend not pinned"
             return 1 ;;
     esac
 }
@@ -245,41 +280,33 @@ switch_iptables_to_legacy() {
     done
 }
 
-# Warn about data left behind by a previous Docker (docker.io or an older
-# docker-ce) in the rootfs /var/lib/docker. WB Docker keeps data-root on
-# /mnt/data and, on 29.x, defaults to the containerd image store — neither
-# reads the old overlay2 graph store, so those images/containers are invisible
-# to the new daemon. We deliberately do NOT touch that data: migrating a graph
-# store across Docker versions/backends isn't reliably automatable (upstream
-# itself only offers `docker save`/registry push from the old daemon, which is
-# already gone by the time this runs). Just tell the user it is there.
-warn_old_docker_not_migrated() {
+# Data of a previous Docker sitting unused in the rootfs /var/lib/docker.
+orphan_docker_data_present() {
     [ -d "$ROOTFS_DOCKER_DATA" ] && [ ! -L "$ROOTFS_DOCKER_DATA" ] && \
     { [ -d "$ROOTFS_DOCKER_DATA/image" ] || \
       [ -d "$ROOTFS_DOCKER_DATA/overlay2" ] || \
-      [ -d "$ROOTFS_DOCKER_DATA/containers" ]; } || return 0
+      [ -d "$ROOTFS_DOCKER_DATA/containers" ]; } || return 1
 
-    # Suppress the warning if the active daemon.json pins data-root back at
-    # /var/lib/docker — then that data is actually in use, nothing is hidden.
+    # Not orphaned if the active daemon.json pins data-root back at
+    # /var/lib/docker — then that data is in use, nothing is hidden.
     if [ -f "$DAEMON_JSON_TARGET" ] && \
        grep -q "\"data-root\"[[:space:]]*:[[:space:]]*\"${ROOTFS_DOCKER_DATA}\"" "$DAEMON_JSON_TARGET"; then
-        return 0
+        return 1
     fi
-
-    log "WARNING: found data from a previous Docker in ${ROOTFS_DOCKER_DATA}"
-    log "  (docker.io or an older docker-ce). WB Docker stores data on /mnt/data and"
-    log "  on 29.x uses the containerd image store, so those images and containers"
-    log "  are NOT visible in 'docker images' / 'docker ps -a'."
-    log "  The data is NOT deleted — it stays in ${ROOTFS_DOCKER_DATA}. Migrating it"
-    log "  across Docker versions cannot be automated; see"
-    log "  https://wiki.wirenboard.com/wiki/Docker"
 }
 
-# Only run our setup on `configure`. dpkg invokes postinst with arguments like
-# `configure <prev-version>` on install/upgrade, and `abort-upgrade`,
-# `abort-remove`, etc. on rollback paths. We do not want to seed Docker layout
-# during a rollback.
-if [ "$1" = "configure" ]; then
+# We deliberately do not touch that data: a graph store cannot be moved across
+# Docker versions/backends reliably (upstream only offers `docker save` from the
+# old daemon, which is gone by the time this runs). Just say it is there.
+warn_old_docker_not_migrated() {
+    orphan_docker_data_present || return 0
+
+    log "WARNING: data of a previous Docker in ${ROOTFS_DOCKER_DATA} is not migrated"
+    log "  It is not deleted, but this daemon does not see it: data-root is on"
+    log "  /mnt/data. See https://wiki.wirenboard.com/wiki/Docker"
+}
+
+run_setup() {
     require_persistent_root
     mkdir -p "$PERSISTENT_ETC_DOCKER" "$PERSISTENT_CONTAINERD" "$PERSISTENT_DOCKER_DATA"
 
@@ -289,4 +316,118 @@ if [ "$1" = "configure" ]; then
     seed_daemon_json
     switch_iptables_to_legacy
     warn_old_docker_not_migrated
-fi
+}
+
+# Our layout on disk. postrm keeps the symlink while the data on /mnt/data lives.
+layout_in_place() {
+    [ -L "$ROOTFS_ETC_DOCKER" ] || return 1
+    [ "$(readlink "$ROOTFS_ETC_DOCKER")" = "$PERSISTENT_ETC_DOCKER" ]
+}
+
+decline_setup() {
+    log "skipping setup: this Docker was not laid out by this package (was: ${1:-unknown})"
+    log "  Its configuration and data are left untouched; it keeps working as before."
+    log "  To apply the WB layout deliberately, run: wb-docker-setup"
+}
+
+# Our versions always carry the +wbNNN suffix (see versions.env).
+our_own_version() {
+    case "$1" in
+        *+wb[0-9]*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# The community installer makes the same symlinks; its data-root tells it apart.
+community_layout_in_use() {
+    [ -d "$COMMUNITY_LEGACY_DOCKER_DATA" ] && [ ! -L "$COMMUNITY_LEGACY_DOCKER_DATA" ]
+}
+
+# `configure <version>` looks the same for an upgrade and for an install over a
+# package that was removed but not purged, so the preinst snippet marks which
+# one dpkg was doing.
+first_install() {
+    if [ -z "${1-}" ]; then
+        return 0
+    fi
+    [ -e "$FIRST_INSTALL_MARKER" ]
+}
+
+dpkg_configure() {
+    if first_install "${1-}"; then
+        log "first install of this package — applying the WB layout"
+        run_setup
+    elif our_own_version "$1" && layout_in_place && ! community_layout_in_use; then
+        log "upgrade from ${1} — re-applying the WB layout"
+        run_setup
+    else
+        decline_setup "$1"
+    fi
+}
+
+# The template is the only thing that sets data-root, and it never overwrites.
+report_data_root() {
+    [ -f "$DAEMON_JSON_TARGET" ] && ! grep -q '"data-root"' "$DAEMON_JSON_TARGET" || return 0
+
+    log "kept your daemon.json: it sets no data-root, so data stays in ${ROOTFS_DOCKER_DATA}"
+    log "  add '\"data-root\": \"${PERSISTENT_DOCKER_DATA}\"' to ${DAEMON_JSON_TARGET} to move it"
+}
+
+# Manual run: dpkg stops the daemon around an upgrade, a manual run has to do it
+# itself — the containerd store must not move under a running containerd.
+manual_setup() {
+    if [ "${1-no}" != yes ] && orphan_docker_data_present; then
+        log "images and containers in ${ROOTFS_DOCKER_DATA} will stop being visible"
+        log "  (not deleted), and running containers will be stopped."
+        if [ ! -t 0 ]; then
+            log "  Refusing without a confirmation — re-run with --yes."
+            exit 1
+        fi
+        printf 'wb-docker: continue? [y/N] ' >&2
+        read -r reply || reply=""
+        case "$reply" in
+            y|Y|yes|YES) ;;
+            *) log "aborted"; exit 1 ;;
+        esac
+    fi
+
+    docker_was_active=no
+    if [ -d /run/systemd/system ]; then
+        if systemctl is-active --quiet docker.service 2>/dev/null; then
+            docker_was_active=yes
+        fi
+        log "stopping docker and containerd for the switch"
+        systemctl stop docker.socket docker.service containerd.service 2>/dev/null || true
+    fi
+
+    run_setup
+    report_data_root
+
+    if [ "$docker_was_active" = yes ]; then
+        log "starting containerd and docker again"
+        systemctl start containerd.service docker.service || \
+            log "WARN: could not start docker again — check 'systemctl status docker'"
+    fi
+}
+
+usage() {
+    cat >&2 <<'USAGE'
+Usage: wb-docker-setup [--yes]
+
+Puts Docker onto the Wiren Board layout: data-root, /etc/docker and containerd
+state on /mnt/data, daemon.json, iptables-legacy.
+
+  --yes   do not ask for confirmation
+USAGE
+}
+
+# dpkg passes its maintainer-script action as $1; an operator passes flags.
+case "${1-}" in
+    configure)  dpkg_configure "${2-}"
+                rm -f "$FIRST_INSTALL_MARKER" ;;
+    "")         manual_setup no ;;
+    --yes|-y)   manual_setup yes ;;
+    -h|--help)  usage ;;
+    -*)         log "unknown option: $1"; usage; exit 2 ;;
+    *)          : ;;
+esac
